@@ -1,3 +1,5 @@
+CREATE EXTENSION pg_search;
+
 SELECT 'this is a test.'::pdb.chinese_compatible::text[];
 SELECT 'this is a test.'::pdb.literal::text[];
 SELECT 'this is a test.'::pdb.jieba::text[];
@@ -11,3 +13,5 @@ SELECT 'this is a test.'::pdb.simple::text[];
 SELECT 'this is a test.'::pdb.simple('stemmer=english')::text[];
 SELECT 'this is a test.'::pdb.whitespace::text[];
 SELECT 'this is a test. fn foo(arg: String) -> impl Foo<''a> { return 42; }'::pdb.source_code::text[];
+
+SELECT ARRAY['this is a test.', 'foo bar baz']::pdb.whitespace::text[];

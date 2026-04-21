@@ -24,7 +24,7 @@ use std::ffi::CStr;
 pub(crate) mod pdb {
     use crate::api::operator::{boost, const_score, fuzzy, slop};
     use crate::api::tokenizers::{
-        CowString, DatumWrapper, GenericTypeWrapper, JsonMarker, JsonbMarker, SqlNameMarker,
+        tokenize, DatumWrapper, GenericTypeWrapper, JsonMarker, JsonbMarker, SqlNameMarker,
         TextArrayMarker, UuidMarker, VarcharArrayMarker,
     };
     use macros::generate_tokenizer_sql;
@@ -129,10 +129,27 @@ pub(crate) mod pdb {
             (*ptr).datum_value
         }
 
-        unsafe fn extract_typoid(wrapper: pg_sys::Datum) -> pg_sys::Oid {
+        pub unsafe fn extract_typoid(wrapper: pg_sys::Datum) -> pg_sys::Oid {
             let ptr = wrapper.cast_mut_ptr::<AliasDatumWithType>();
             (*ptr).typoid
         }
+    }
+
+    unsafe fn wrap_generic_type<InTy, InMarker, OutTy, OutMarker>(
+        input: GenericTypeWrapper<InTy, InMarker>,
+    ) -> GenericTypeWrapper<OutTy, OutMarker>
+    where
+        InTy: DatumWrapper,
+        OutTy: DatumWrapper,
+        InMarker: SqlNameMarker,
+        OutMarker: SqlNameMarker,
+    {
+        // Wrap datum and original typoid in a custom structure
+        let wrapper_ptr = unsafe { AliasDatumWithType::new(input.datum, input.typoid) };
+
+        // Return the wrapper with the original typoid preserved
+        // This allows PostgreSQL to track array vs scalar types correctly
+        GenericTypeWrapper::new(pg_sys::Datum::from(wrapper_ptr), input.typoid)
     }
 
     macro_rules! cast_alias {
@@ -146,16 +163,11 @@ pub(crate) mod pdb {
 
                 #[pg_extern(immutable, parallel_safe, requires = [tokenize_alias])]
                 unsafe fn [<$fn_prefix _to_alias>](
-                    arr: GenericTypeWrapper<$rust_ty, [<$marker Marker>]>,
+                    mut arr: GenericTypeWrapper<$rust_ty, [<$marker Marker>]>,
                 ) -> GenericTypeWrapper<Alias, AliasMarker> {
-                    let original_typoid: pg_sys::Oid = $typoid;
-
-                    // Wrap datum and original typoid in a custom structure
-                    let wrapper_ptr = AliasDatumWithType::new(arr.datum, original_typoid);
-
-                    // Return the wrapper with the original typoid preserved
-                    // This allows PostgreSQL to track array vs scalar types correctly
-                    GenericTypeWrapper::new(pg_sys::Datum::from(wrapper_ptr), original_typoid)
+                    // TODO probably not needed but maintains old behavior
+                    arr.typoid = $typoid;
+                    wrap_generic_type(arr)
                 }
             }
         };
@@ -255,19 +267,7 @@ pub(crate) mod pdb {
                     super::super::apply_typmod(&mut tokenizer, typmod);
                 }
 
-                let mut analyzer = tokenizer
-                    .to_tantivy_tokenizer()
-                    .expect("failed to convert tokenizer to tantivy tokenizer");
-
-                let s = s.to_str();
-                let mut stream = analyzer.token_stream(&s);
-
-                let mut tokens = Vec::new();
-                while stream.advance() {
-                    let token = stream.token();
-                    tokens.push(token.text.to_string());
-                }
-                tokens
+                unsafe { tokenize(s, tokenizer) }
             }
 
             paste! {
@@ -300,35 +300,36 @@ pub(crate) mod pdb {
                 fn $json_cast_name(
                     json: GenericTypeWrapper<pgrx::Json, JsonMarker>,
                 ) -> GenericTypeWrapper<$rust_name, [<$rust_name JsonMarker>]> {
-                    GenericTypeWrapper::new(json.datum, json.typoid)
+                    unsafe { wrap_generic_type(json) }
                 }
 
                 #[pg_extern(immutable, parallel_safe, requires = [ $cast_name ])]
                 unsafe fn $jsonb_cast_name(
                     jsonb: GenericTypeWrapper<pgrx::JsonB, JsonbMarker>,
                 ) -> GenericTypeWrapper<$rust_name, [<$rust_name JsonbMarker>]> {
-                    GenericTypeWrapper::new(jsonb.datum, jsonb.typoid)
+                    unsafe { wrap_generic_type(jsonb) }
                 }
 
                 #[pg_extern(immutable, parallel_safe, requires = [ $cast_name ])]
                 unsafe fn $uuid_cast_name(
                     uuid: GenericTypeWrapper<pgrx::datum::Uuid, UuidMarker>,
                 ) -> GenericTypeWrapper<$rust_name, [<$rust_name UuidMarker>]> {
-                    GenericTypeWrapper::new(uuid.datum, uuid.typoid)
+                    unsafe { wrap_generic_type(uuid) }
                 }
 
                 #[pg_extern(immutable, parallel_safe, requires = [ $cast_name ])]
                 unsafe fn $text_array_cast_name(
                     arr: GenericTypeWrapper<Vec<String>, TextArrayMarker>,
                 ) -> GenericTypeWrapper<$rust_name, [<$rust_name TextArrayMarker>]> {
-                    GenericTypeWrapper::new(arr.datum, arr.typoid)
+                    pgrx::warning!("{:?}, {:?}", arr.datum, arr.typoid);
+                    unsafe { wrap_generic_type(arr) }
                 }
 
                 #[pg_extern(immutable, parallel_safe, requires = [ $cast_name ])]
                 unsafe fn $varchar_array_cast_name(
                     arr: GenericTypeWrapper<Vec<String>, VarcharArrayMarker>,
                 ) -> GenericTypeWrapper<$rust_name, [<$rust_name VarcharArrayMarker>]> {
-                    GenericTypeWrapper::new(arr.datum, arr.typoid)
+                    unsafe { wrap_generic_type(arr) }
                 }
 
                 #[pg_extern(immutable, parallel_safe, requires = [ $cast_name ])]
