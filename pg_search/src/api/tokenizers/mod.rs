@@ -15,7 +15,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
-use crate::api::tokenizers::definitions::pdb::AliasDatumWithType;
+use crate::api::tokenizers::definitions::pdb::DatumWithType;
 use crate::postgres::catalog::{
     is_citext_oid, lookup_type_category, lookup_type_name, lookup_typoid,
 };
@@ -566,11 +566,11 @@ where
         }
     };
 
-    // Check if this is a wrapped AliasDatumWithType using magic number verification
+    // Check if this is a wrapped DatumWithType using magic number verification
     // For text literals, PostgreSQL might pass them directly without wrapping
     // due to LIKE = text in the type definition
     // TODO is the LIKE doing anything useful if conversion is effectively manditory?
-    if !AliasDatumWithType::is_wrapped(wrapper_datum) {
+    if !DatumWithType::is_wrapped(wrapper_datum) {
         // Not wrapped, it's raw text (or null)
         let varlena = wrapper_datum.cast_mut_ptr::<pg_sys::varlena>();
         let detoasted = pg_sys::pg_detoast_datum(varlena);
@@ -580,8 +580,8 @@ where
         return tokens;
     }
 
-    let typoid = AliasDatumWithType::extract_typoid(wrapper_datum);
-    let original_datum = AliasDatumWithType::extract_datum(wrapper_datum);
+    let typoid = DatumWithType::extract_typoid(wrapper_datum);
+    let original_datum = DatumWithType::extract_datum(wrapper_datum);
     pgrx::warning!("to_strs {typoid}");
     match typoid {
         pg_sys::TEXTARRAYOID | pg_sys::VARCHARARRAYOID => {
@@ -598,7 +598,7 @@ where
         ),
     }
 
-    return tokens;
+    tokens
 }
 
 struct GenericTypeWrapper<Type: DatumWrapper, SqlName: SqlNameMarker> {

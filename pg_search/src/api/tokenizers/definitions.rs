@@ -71,7 +71,7 @@ pub(crate) mod pdb {
     /// data, along with proper cleanup when the wrapper is freed. This would make the wrapper
     /// fully self-contained and safe regardless of the input datum's lifetime.
     #[repr(C)]
-    pub struct AliasDatumWithType {
+    pub struct DatumWithType {
         vl_len_: i32,               // varlena header
         magic: u32,                 // magic number to identify wrapped datums
         typoid: pg_sys::Oid,        // original type OID
@@ -82,10 +82,10 @@ pub(crate) mod pdb {
     // PostgreSQL text values cannot contain embedded nulls, making false positives impossible
     const ALIAS_MAGIC: u32 = 0x414C0053; // 'A', 'L', 0x00, 'S'
 
-    impl AliasDatumWithType {
+    impl DatumWithType {
         unsafe fn new(datum: pg_sys::Datum, typoid: pg_sys::Oid) -> *mut Self {
-            let size = std::mem::size_of::<AliasDatumWithType>();
-            let ptr = pg_sys::palloc(size) as *mut AliasDatumWithType;
+            let size = std::mem::size_of::<DatumWithType>();
+            let ptr = pg_sys::palloc(size) as *mut DatumWithType;
 
             // Since pdb.alias is defined as LIKE = text, PostgreSQL treats it as a varlena
             // (variable-length) type. All varlena types must have a valid size header in the
@@ -110,27 +110,27 @@ pub(crate) mod pdb {
             ptr
         }
 
-        /// Check if a datum is a wrapped AliasDatumWithType by verifying size and magic number
+        /// Check if a datum is a wrapped DatumWithType by verifying size and magic number
         pub unsafe fn is_wrapped(wrapper: pg_sys::Datum) -> bool {
-            let ptr = wrapper.cast_mut_ptr::<AliasDatumWithType>();
+            let ptr = wrapper.cast_mut_ptr::<DatumWithType>();
             if ptr.is_null() {
                 return false;
             }
 
             let vl_len = pgrx::varlena::varsize_any(ptr.cast::<pg_sys::varlena>());
-            let expected_size = std::mem::size_of::<AliasDatumWithType>();
+            let expected_size = std::mem::size_of::<DatumWithType>();
 
             // Check both size AND magic number to avoid false positives
             vl_len == expected_size && (*ptr).magic == ALIAS_MAGIC
         }
 
         pub unsafe fn extract_datum(wrapper: pg_sys::Datum) -> pg_sys::Datum {
-            let ptr = wrapper.cast_mut_ptr::<AliasDatumWithType>();
+            let ptr = wrapper.cast_mut_ptr::<DatumWithType>();
             (*ptr).datum_value
         }
 
         pub unsafe fn extract_typoid(wrapper: pg_sys::Datum) -> pg_sys::Oid {
-            let ptr = wrapper.cast_mut_ptr::<AliasDatumWithType>();
+            let ptr = wrapper.cast_mut_ptr::<DatumWithType>();
             (*ptr).typoid
         }
     }
@@ -145,7 +145,7 @@ pub(crate) mod pdb {
         OutMarker: SqlNameMarker,
     {
         // Wrap datum and original typoid in a custom structure
-        let wrapper_ptr = unsafe { AliasDatumWithType::new(input.datum, input.typoid) };
+        let wrapper_ptr = unsafe { DatumWithType::new(input.datum, input.typoid) };
 
         // Return the wrapper with the original typoid preserved
         // This allows PostgreSQL to track array vs scalar types correctly
@@ -393,12 +393,12 @@ pub(crate) mod pdb {
         unsafe {
             let wrapper_datum = input.as_datum();
 
-            // Check if this is a wrapped AliasDatumWithType using magic number verification
+            // Check if this is a wrapped DatumWithType using magic number verification
             // For text literals, PostgreSQL might pass them directly without wrapping
             // due to LIKE = text in the type definition
-            if AliasDatumWithType::is_wrapped(wrapper_datum) {
-                let typoid = AliasDatumWithType::extract_typoid(wrapper_datum);
-                let original_datum = AliasDatumWithType::extract_datum(wrapper_datum);
+            if DatumWithType::is_wrapped(wrapper_datum) {
+                let typoid = DatumWithType::extract_typoid(wrapper_datum);
+                let original_datum = DatumWithType::extract_datum(wrapper_datum);
 
                 // Get the output function for the original type
                 let mut typoutput: pg_sys::Oid = pg_sys::InvalidOid;
