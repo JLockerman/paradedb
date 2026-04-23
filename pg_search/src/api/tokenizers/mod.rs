@@ -742,7 +742,8 @@ datum_wrapper_for!(
     Vec<pgrx::datum::Timestamp>,
     Vec<pgrx::datum::TimestampWithTimeZone>,
     Vec<pgrx::datum::TimeWithTimeZone>,
-    Vec<pgrx::datum::AnyNumeric>
+    Vec<pgrx::datum::AnyNumeric>,
+    pgrx::PgBox<pg_sys::bytea>
 );
 
 pub trait SqlNameMarker {

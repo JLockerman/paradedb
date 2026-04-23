@@ -180,7 +180,7 @@ pub(crate) mod pdb {
     }
 
     macro_rules! define_tokenizer_type {
-        ($rust_name:ident, $tokenizer_conf:expr, $cast_name:ident, $json_cast_name:ident, $jsonb_cast_name:ident, $uuid_cast_name:ident, $text_array_cast_name:ident, $varchar_array_cast_name:ident, $sql_name:literal, preferred = $preferred:literal, custom_typmod = $custom_typmod:literal) => {
+        ($def_name:literal, $rust_name:ident, $tokenizer_conf:expr, $cast_name:ident, $json_cast_name:ident, $jsonb_cast_name:ident, $uuid_cast_name:ident, $text_array_cast_name:ident, $varchar_array_cast_name:ident, $sql_name:literal, preferred = $preferred:literal, custom_typmod = $custom_typmod:literal) => {
             pub struct $rust_name(pg_sys::Datum);
 
             impl TokenizerCtor for $rust_name {
@@ -276,6 +276,12 @@ pub(crate) mod pdb {
             }
 
             paste! {
+
+                struct [<$rust_name TextMarker>];
+                impl SqlNameMarker for [<$rust_name TextMarker>] {
+                    const SQL_NAME: &'static str = concat!("pdb.", $sql_name);
+                }
+
                 struct [<$rust_name JsonMarker>];
                 impl SqlNameMarker for [<$rust_name JsonMarker>] {
                     const SQL_NAME: &'static str = concat!("pdb.", $sql_name);
@@ -299,6 +305,23 @@ pub(crate) mod pdb {
                 struct [<$rust_name UuidMarker>];
                 impl SqlNameMarker for [<$rust_name UuidMarker>] {
                     const SQL_NAME: &'static str = concat!("pdb.", $sql_name);
+                }
+
+                #[pg_extern(immutable, strict, parallel_safe, requires = [$def_name])] // TODO handle typmod
+                fn [<$sql_name _in>](s: &std::ffi::CStr) -> GenericTypeWrapper<$rust_name, [<$rust_name TextMarker>]> {
+                    let text = pgrx::rust_byte_slice_to_bytea(s.to_bytes());
+                    let wrapper_ptr = unsafe { DatumWithType::new(text.into_datum().unwrap(), pg_sys::TEXTOID) };
+
+                    // Return the wrapper with the original typoid preserved
+                    // This allows PostgreSQL to track array vs scalar types correctly
+                    GenericTypeWrapper::new(pg_sys::Datum::from(wrapper_ptr), pg_sys::TEXTOID)
+                }
+
+                #[pg_extern(immutable, strict, parallel_safe, requires = [$def_name])]
+                fn [<$sql_name _out>](s: $rust_name, fcinfo: pg_sys::FunctionCallInfo) -> std::ffi::CString  {
+                    let mut str = $cast_name(s, fcinfo).join(" ");
+                    str.push('\0');
+                    CString::new(str).unwrap()
                 }
 
                 #[pg_extern(immutable, parallel_safe, requires = [ $cast_name ])]
@@ -362,6 +385,7 @@ pub(crate) mod pdb {
             }
 
             generate_tokenizer_sql!(
+                def_name = $def_name,
                 rust_name = $rust_name,
                 sql_name = $sql_name,
                 cast_name = $cast_name,
@@ -378,6 +402,7 @@ pub(crate) mod pdb {
     }
 
     define_tokenizer_type!(
+        "AliasDef",
         Alias,
         SearchTokenizer::Simple(SearchTokenizerFilters::default()),
         tokenize_alias,
@@ -431,18 +456,19 @@ pub(crate) mod pdb {
         }
     }
 
-    extension_sql!(
-        r#"
-        -- Override the output function for pdb.alias
-        CREATE OR REPLACE FUNCTION pdb.alias_out(pdb.alias) RETURNS cstring
-            AS 'MODULE_PATHNAME', 'alias_out_safe_wrapper'
-            LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE;
-        "#,
-        name = "alias_out_safe_override",
-        requires = [tokenize_alias, alias_out_safe]
-    );
+    // extension_sql!(
+    //     r#"
+    //     -- Override the output function for pdb.alias
+    //     CREATE OR REPLACE FUNCTION pdb.alias_out(pdb.alias) RETURNS cstring
+    //         AS 'MODULE_PATHNAME', 'alias_out_safe_wrapper'
+    //         LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE;
+    //     "#,
+    //     name = "alias_out_safe_override",
+    //     requires = [tokenize_alias, alias_out_safe]
+    // );
 
     define_tokenizer_type!(
+        "SimpleDef",
         Simple,
         SearchTokenizer::Simple(SearchTokenizerFilters::default()),
         tokenize_simple,
@@ -457,6 +483,7 @@ pub(crate) mod pdb {
     );
 
     define_tokenizer_type!(
+        "WhitespaceDef",
         Whitespace,
         SearchTokenizer::WhiteSpace(SearchTokenizerFilters::default()),
         tokenize_whitespace,
@@ -471,6 +498,7 @@ pub(crate) mod pdb {
     );
 
     define_tokenizer_type!(
+        "LiteralDef",
         Literal,
         SearchTokenizer::Keyword,
         tokenize_literal,
@@ -485,6 +513,7 @@ pub(crate) mod pdb {
     );
 
     define_tokenizer_type!(
+        "LiteralNormalizedDef",
         LiteralNormalized,
         SearchTokenizer::LiteralNormalized(SearchTokenizerFilters::default()),
         tokenize_literal_normalized,
@@ -499,6 +528,7 @@ pub(crate) mod pdb {
     );
 
     define_tokenizer_type!(
+        "ChineseCompatibleDef",
         ChineseCompatible,
         SearchTokenizer::ChineseCompatible(SearchTokenizerFilters::default()),
         tokenize_chinese_compatible,
@@ -513,6 +543,7 @@ pub(crate) mod pdb {
     );
 
     define_tokenizer_type!(
+        "LinderaDef",
         Lindera,
         SearchTokenizer::Lindera {
             language: LinderaLanguage::Chinese,
@@ -531,6 +562,7 @@ pub(crate) mod pdb {
     );
 
     define_tokenizer_type!(
+        "JiebaDef",
         Jieba,
         SearchTokenizer::Jieba {
             chinese_convert: None,
@@ -548,6 +580,7 @@ pub(crate) mod pdb {
     );
 
     define_tokenizer_type!(
+        "SourceCodeDef",
         SourceCode,
         SearchTokenizer::SourceCode(SearchTokenizerFilters::default()),
         tokenize_source_code,
@@ -562,6 +595,7 @@ pub(crate) mod pdb {
     );
 
     define_tokenizer_type!(
+        "IcuDef",
         Icu,
         SearchTokenizer::ICUTokenizer(SearchTokenizerFilters::default()),
         tokenize_icu,
@@ -576,6 +610,7 @@ pub(crate) mod pdb {
     );
 
     define_tokenizer_type!(
+        "NgramDef",
         Ngram,
         SearchTokenizer::Ngram {
             min_gram: 1,
@@ -596,6 +631,7 @@ pub(crate) mod pdb {
     );
 
     define_tokenizer_type!(
+        "EdgeNgramDef",
         EdgeNgram,
         SearchTokenizer::EdgeNgram {
             min_gram: 1,
@@ -615,6 +651,7 @@ pub(crate) mod pdb {
     );
 
     define_tokenizer_type!(
+        "RegexDef",
         Regex,
         SearchTokenizer::RegexTokenizer {
             pattern: ".*".to_string(),
@@ -632,6 +669,7 @@ pub(crate) mod pdb {
     );
 
     define_tokenizer_type!(
+        "UnicodeWordsDef",
         UnicodeWords,
         SearchTokenizer::UnicodeWords {
             remove_emojis: false,
