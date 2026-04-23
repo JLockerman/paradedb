@@ -569,7 +569,7 @@ where
     // Check if this is a wrapped DatumWithType using magic number verification
     // For text literals, PostgreSQL might pass them directly without wrapping
     // due to LIKE = text in the type definition
-    // TODO is the LIKE doing anything useful if conversion is effectively manditory?
+    // TODO is the LIKE doing anything useful if conversion is effectively mandatory?
     if !DatumWithType::is_wrapped(wrapper_datum) {
         // Not wrapped, it's raw text (or null)
         let varlena = wrapper_datum.cast_mut_ptr::<pg_sys::varlena>();
