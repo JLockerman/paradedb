@@ -72,41 +72,90 @@ pub(crate) mod pdb {
     /// fully self-contained and safe regardless of the input datum's lifetime.
     #[repr(C)]
     pub struct DatumWithType {
-        vl_len_: pg_sys::varlena,   // varlena header
-        magic: u32,                 // magic number to identify wrapped datums
-        typoid: pg_sys::Oid,        // original type OID
-        _padding: [u8; 4],          // TODO relic from original format, do we care?
-        datum_value: pg_sys::Datum, // the actual datum value (RAW POINTER for varlena types!)
+        // varlena header
+        vl_len_: pg_sys::varlena,
+        // contents, separate for convenience with vardata functions.
+        contents: DatumWithTypeContents,
+    }
+    pub struct DatumWithTypeContents {
+        // magic number to identify wrapped datums
+        magic: u32,
+        // Metadata needed when extracting the wrapped data
+        elem_length: i16,
+        elem_by_val: bool,
+        elem_align: std::ffi::c_char,
+        // original type OID
+        typoid: pg_sys::Oid,
+        // underlying types data goes here
     }
 
+    // Check that there's no extra padding
     const _: () = assert!(
         std::mem::size_of::<DatumWithType>()
             == std::mem::size_of::<i32>()
                 + std::mem::size_of::<u32>()
+                + std::mem::size_of::<i16>()
+                + std::mem::size_of::<bool>()
+                + std::mem::size_of::<std::ffi::c_char>()
                 + std::mem::size_of::<pg_sys::Oid>()
-                + std::mem::size_of::<[u8; 4]>()
-                + std::mem::size_of::<pg_sys::Datum>()
     );
 
-    // Magic number: "AL\0S" - includes a null byte to ensure no valid text string can match
-    // PostgreSQL text values cannot contain embedded nulls, making false positives impossible
-    const ALIAS_MAGIC: u32 = 0x414C0053; // 'A', 'L', 0x00, 'S'
+    // Check that the data section is sufficiently aligned to store any type.
+    const _: () = assert!(std::mem::size_of::<DatumWithType>() % 8 == 0);
+
+    // Magic number: "err\0" - includes null bytes to ensure no valid text string can match
+    // (PostgreSQL text values cannot contain embedded nulls). Prints as the string "err" if
+    // interpreted as TEXT, making it a bit easier to catch.
+    const ALIAS_MAGIC: u32 = u32::from_ne_bytes([b'e', b'r', b'r', b'\0']);
 
     impl DatumWithType {
-        unsafe fn new(datum: pg_sys::Datum, typoid: pg_sys::Oid) -> *mut Self {
-            let size = std::mem::size_of::<DatumWithType>();
-            let ptr = pg_sys::palloc(size) as *mut DatumWithType;
+        unsafe fn new(mut datum: pg_sys::Datum, typoid: pg_sys::Oid) -> *mut Self {
+            use pgrx::varlena::varsize_any;
+            use std::mem::size_of;
+
+            // load metadata about the underlying type.
+            let mut elem_length = 0;
+            let mut elem_by_val = false;
+            let mut elem_align = 0;
+            pg_sys::get_typlenbyvalalign(
+                typoid,
+                &mut elem_length,
+                &mut elem_by_val,
+                &mut elem_align,
+            );
+
+            // Ensure that the data isn't TOASTed.
+            if elem_length == -1 {
+                datum = pg_sys::pg_detoast_datum(datum.cast_mut_ptr()).into();
+            }
+
+            // based on Postgres's `att_addlength_datum`
+            // (specifically `att_addlength_pointer` which it calls)
+            let data_len = if elem_length > 0 {
+                elem_length as usize
+            } else if elem_length == -1 {
+                varsize_any(datum.cast_mut_ptr::<pg_sys::varlena>())
+            } else {
+                unreachable!("tried to pass a C string as a tokenizer")
+            };
+
+            // DatumWithType is a multiple of 8bytes (the largest alignment
+            // postgres uses) so we don't need any additional aligning.
+            let size = size_of::<DatumWithType>() + data_len;
+            let ptr = pg_sys::palloc(size).cast::<DatumWithType>();
 
             *ptr = DatumWithType {
                 vl_len_: pg_sys::varlena::default(),
-                // Set the magic number to identify this as a wrapped datum
-                // This prevents false positives when text happens to be the same size
-                magic: ALIAS_MAGIC,
-                // set the original type OID and the actual datum value
-                typoid,
-                // explicitly 0 the padding for consistency in const-eval
-                _padding: [0; 4],
-                datum_value: datum,
+                contents: DatumWithTypeContents {
+                    // Set the magic number to identify this as a wrapped datum
+                    // This prevents false positives when text happens to be the same size
+                    magic: ALIAS_MAGIC,
+                    elem_length,
+                    elem_by_val,
+                    elem_align,
+                    // set the original type OID and the actual datum value
+                    typoid,
+                },
             };
 
             // Since pdb.alias is defined as LIKE = text, PostgreSQL treats it as a varlena
@@ -121,37 +170,69 @@ pub(crate) mod pdb {
             //   - Copying/serializing the datum would cause segfaults
             pgrx::set_varsize_4b(&mut (*ptr).vl_len_, size as i32);
 
+            // pgrx::warning!("new tokenizer ptr: {:?}, sz: {} of {typoid}", ptr, size);
+            // Copy in the data for the underlying type
+            // (based on Postgres's `ArrayCastAndSet()`).
+            let data_ptr = ptr.add(1).cast::<u8>();
+            if elem_by_val {
+                pg_sys::store_att_byval(data_ptr.cast(), datum, data_len.try_into().unwrap());
+            } else {
+                data_ptr.copy_from(datum.cast_mut_ptr(), data_len);
+            }
+
             ptr
         }
 
         /// Check if a datum is a wrapped DatumWithType by verifying size and magic number
         pub unsafe fn is_wrapped(wrapper: pg_sys::Datum) -> bool {
-            let ptr = wrapper.cast_mut_ptr::<DatumWithType>();
+            use std::mem::offset_of;
+            // let ptr = wrapper.cast_mut_ptr::<DatumWithType>();
+
+            let ptr = pg_sys::pg_detoast_datum_packed(wrapper.cast_mut_ptr());
             if ptr.is_null() {
                 return false;
             }
-
             let vl_len = pgrx::varlena::varsize_any(ptr.cast::<pg_sys::varlena>());
-            let expected_size = std::mem::size_of::<DatumWithType>();
+            let minimum_size = std::mem::size_of::<DatumWithTypeContents>();
 
-            // Check both size AND magic number to avoid false positives
-            // NOTE: if ptr is TEXT than ptr.magic could be unaligned
-            vl_len == expected_size
-                && ptr
-                    .byte_add(std::mem::offset_of!(DatumWithType, magic))
-                    .cast::<u32>()
-                    .read_unaligned()
-                    == ALIAS_MAGIC
+            // Check both size AND magic number to avoid false positives.
+            // NOTE: if ptr is TEXT than ptr.magic could be unaligned.
+            // NOTE: False negatives are less risky than false positives since
+            //       any element of this type is prefixed with the valid C string
+            //       `err`
+            if vl_len < minimum_size {
+                return false;
+            }
+
+            // pgrx::warning!("    check tok ptr: {:?}, sz: {}", ptr, vl_len);
+            let data_ptr = pgrx::varlena::vardata_any(ptr);
+            let metadata = data_ptr.cast::<DatumWithTypeContents>().read_unaligned();
+            metadata.magic == ALIAS_MAGIC
+            // && ptr
+            //     .byte_add(offset_of!(DatumWithType, magic))
+            //     .cast::<u32>()
+            //     .read_unaligned()
+            //     == ALIAS_MAGIC
         }
 
         pub unsafe fn extract_datum(wrapper: pg_sys::Datum) -> pg_sys::Datum {
-            let ptr = wrapper.cast_mut_ptr::<DatumWithType>();
-            (*ptr).datum_value
+            debug_assert!(Self::is_wrapped(wrapper));
+            // It would be nice to use pg_detoast_datum_packed(), but then if the
+            // stored type was using the 4B header reading it could be unaligned.
+            let ptr = pg_sys::pg_detoast_datum(wrapper.cast_mut_ptr());
+            let contents_ptr = pgrx::varlena::vardata_any(ptr).cast::<DatumWithTypeContents>();
+            let contents = contents_ptr.read();
+
+            let data_ptr = contents_ptr.add(1).cast();
+            pg_sys::fetch_att(data_ptr, contents.elem_by_val, contents.elem_length.into())
         }
 
+        // TODO non-datum based?
         pub unsafe fn extract_typoid(wrapper: pg_sys::Datum) -> pg_sys::Oid {
-            let ptr = wrapper.cast_mut_ptr::<DatumWithType>();
-            (*ptr).typoid
+            debug_assert!(Self::is_wrapped(wrapper));
+            let ptr = pg_sys::pg_detoast_datum_packed(wrapper.cast_mut_ptr());
+            let contents_ptr = pgrx::varlena::vardata_any(ptr).cast::<DatumWithTypeContents>();
+            (*contents_ptr).typoid
         }
     }
 
@@ -185,7 +266,6 @@ pub(crate) mod pdb {
                 unsafe fn [<$fn_prefix _to_alias>](
                     mut arr: GenericTypeWrapper<$rust_ty, [<$marker Marker>]>,
                 ) -> GenericTypeWrapper<Alias, AliasMarker> {
-                    pgrx::warning!("cast {}", stringify!([<$fn_prefix _to_alias>]));
                     // TODO probably not needed but maintains old behavior
                     arr.typoid = $typoid;
                     wrap_generic_type(arr)
@@ -324,7 +404,6 @@ pub(crate) mod pdb {
 
                 #[pg_extern(immutable, strict, parallel_safe, requires = [$def_name])] // TODO handle typmod
                 fn [<$sql_name _in>](s: &std::ffi::CStr) -> GenericTypeWrapper<$rust_name, [<$rust_name TextMarker>]> {
-                    pgrx::warning!("input {}", stringify!([<$sql_name _in>]));
                     let text = pgrx::rust_byte_slice_to_bytea(s.to_bytes());
                     let wrapper_ptr = unsafe { DatumWithType::new(text.into_datum().unwrap(), pg_sys::TEXTOID) };
 
@@ -346,8 +425,9 @@ pub(crate) mod pdb {
 
                         let mut typoutput = 0.into();
                         let mut typ_is_varlena = true;
-                        let typoid = DatumWithType::extract_typoid(wrapper_datum);
-                        let original_datum = DatumWithType::extract_datum(wrapper_datum);
+                        // TODO better typing
+                        let typoid = DatumWithType::extract_typoid(detoasted.into());
+                        let original_datum = DatumWithType::extract_datum(detoasted.into());
                         pg_sys::getTypeOutputInfo(typoid, &mut typoutput, &mut typ_is_varlena);
                         std::ffi::CStr::from_ptr(pg_sys::OidOutputFunctionCall(typoutput, original_datum))
                     }

@@ -555,7 +555,9 @@ where
         .to_tantivy_tokenizer()
         .expect("failed to convert tokenizer to tantivy tokenizer");
 
-    let wrapper_datum = to_tokenize.as_datum();
+    let ptr = to_tokenize.as_datum().cast_mut_ptr();
+    let detoasted = pg_sys::pg_detoast_datum(ptr);
+    let wrapper_datum = pg_sys::Datum::from(detoasted);
     let mut tokens = Vec::new();
     let mut tokenize = |s: &str| {
         let mut stream = analyzer.token_stream(s);
@@ -573,15 +575,7 @@ where
     if !DatumWithType::is_wrapped(wrapper_datum) {
         // Not wrapped, it's raw text (or null)
         let varlena = wrapper_datum.cast_mut_ptr::<pg_sys::varlena>();
-        let detoasted = pg_sys::pg_detoast_datum(varlena);
-        {
-            let len = pgrx::varsize_any_exhdr(varlena);
-            let data = pgrx::vardata_any(varlena);
-            let slice = std::slice::from_raw_parts(data.cast::<u8>(), len);
-            pgrx::warning!("output {}, {:x?}", String::from_utf8_lossy(slice), slice)
-        }
-
-        let s = convert_varlena_to_str_memoized(detoasted);
+        let s = convert_varlena_to_str_memoized(varlena);
         tokenize(s);
         return tokens;
     }
