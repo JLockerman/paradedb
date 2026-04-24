@@ -72,11 +72,21 @@ pub(crate) mod pdb {
     /// fully self-contained and safe regardless of the input datum's lifetime.
     #[repr(C)]
     pub struct DatumWithType {
-        vl_len_: i32,               // varlena header
+        vl_len_: pg_sys::varlena,   // varlena header
         magic: u32,                 // magic number to identify wrapped datums
         typoid: pg_sys::Oid,        // original type OID
+        _padding: [u8; 4],          // TODO relic from original format, do we care?
         datum_value: pg_sys::Datum, // the actual datum value (RAW POINTER for varlena types!)
     }
+
+    const _: () = assert!(
+        std::mem::size_of::<DatumWithType>()
+            == std::mem::size_of::<i32>()
+                + std::mem::size_of::<u32>()
+                + std::mem::size_of::<pg_sys::Oid>()
+                + std::mem::size_of::<[u8; 4]>()
+                + std::mem::size_of::<pg_sys::Datum>()
+    );
 
     // Magic number: "AL\0S" - includes a null byte to ensure no valid text string can match
     // PostgreSQL text values cannot contain embedded nulls, making false positives impossible
@@ -86,6 +96,18 @@ pub(crate) mod pdb {
         unsafe fn new(datum: pg_sys::Datum, typoid: pg_sys::Oid) -> *mut Self {
             let size = std::mem::size_of::<DatumWithType>();
             let ptr = pg_sys::palloc(size) as *mut DatumWithType;
+
+            *ptr = DatumWithType {
+                vl_len_: pg_sys::varlena::default(),
+                // Set the magic number to identify this as a wrapped datum
+                // This prevents false positives when text happens to be the same size
+                magic: ALIAS_MAGIC,
+                // set the original type OID and the actual datum value
+                typoid,
+                // explicitly 0 the padding for consistency in const-eval
+                _padding: [0; 4],
+                datum_value: datum,
+            };
 
             // Since pdb.alias is defined as LIKE = text, PostgreSQL treats it as a varlena
             // (variable-length) type. All varlena types must have a valid size header in the
@@ -97,15 +119,7 @@ pub(crate) mod pdb {
             //   - PostgreSQL wouldn't know where our data ends (memory corruption)
             //   - TOAST (oversized-attribute storage) would fail
             //   - Copying/serializing the datum would cause segfaults
-            pgrx::set_varsize_4b(ptr.cast(), size as i32);
-
-            // Set the magic number to identify this as a wrapped datum
-            // This prevents false positives when text happens to be the same size
-            (*ptr).magic = ALIAS_MAGIC;
-
-            // set the original type OID and the actual datum value
-            (*ptr).typoid = typoid;
-            (*ptr).datum_value = datum;
+            pgrx::set_varsize_4b(&mut (*ptr).vl_len_, size as i32);
 
             ptr
         }
@@ -171,6 +185,7 @@ pub(crate) mod pdb {
                 unsafe fn [<$fn_prefix _to_alias>](
                     mut arr: GenericTypeWrapper<$rust_ty, [<$marker Marker>]>,
                 ) -> GenericTypeWrapper<Alias, AliasMarker> {
+                    pgrx::warning!("cast {}", stringify!([<$fn_prefix _to_alias>]));
                     // TODO probably not needed but maintains old behavior
                     arr.typoid = $typoid;
                     wrap_generic_type(arr)
@@ -309,6 +324,7 @@ pub(crate) mod pdb {
 
                 #[pg_extern(immutable, strict, parallel_safe, requires = [$def_name])] // TODO handle typmod
                 fn [<$sql_name _in>](s: &std::ffi::CStr) -> GenericTypeWrapper<$rust_name, [<$rust_name TextMarker>]> {
+                    pgrx::warning!("input {}", stringify!([<$sql_name _in>]));
                     let text = pgrx::rust_byte_slice_to_bytea(s.to_bytes());
                     let wrapper_ptr = unsafe { DatumWithType::new(text.into_datum().unwrap(), pg_sys::TEXTOID) };
 
@@ -318,10 +334,23 @@ pub(crate) mod pdb {
                 }
 
                 #[pg_extern(immutable, strict, parallel_safe, requires = [$def_name])]
-                fn [<$sql_name _out>](s: $rust_name, fcinfo: pg_sys::FunctionCallInfo) -> std::ffi::CString  {
-                    let mut str = $cast_name(s, fcinfo).join(" ");
-                    str.push('\0');
-                    CString::new(str).unwrap()
+                fn [<$sql_name _out>](s: $rust_name) -> &'static std::ffi::CStr  {
+                    let wrapper_datum = s.as_datum();
+                    let varlena = wrapper_datum.cast_mut_ptr::<pg_sys::varlena>();
+                    unsafe {
+                        let detoasted = pg_sys::pg_detoast_datum(varlena);
+                        if !DatumWithType::is_wrapped(pg_sys::Datum::from(detoasted)) {
+                            let cstr = pgrx::pg_sys::text_to_cstring(detoasted);
+                            return std::ffi::CStr::from_ptr(cstr);
+                        }
+
+                        let mut typoutput = 0.into();
+                        let mut typ_is_varlena = true;
+                        let typoid = DatumWithType::extract_typoid(wrapper_datum);
+                        let original_datum = DatumWithType::extract_datum(wrapper_datum);
+                        pg_sys::getTypeOutputInfo(typoid, &mut typoutput, &mut typ_is_varlena);
+                        std::ffi::CStr::from_ptr(pg_sys::OidOutputFunctionCall(typoutput, original_datum))
+                    }
                 }
 
                 #[pg_extern(immutable, parallel_safe, requires = [ $cast_name ])]

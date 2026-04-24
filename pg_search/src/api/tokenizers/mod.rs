@@ -574,6 +574,12 @@ where
         // Not wrapped, it's raw text (or null)
         let varlena = wrapper_datum.cast_mut_ptr::<pg_sys::varlena>();
         let detoasted = pg_sys::pg_detoast_datum(varlena);
+        {
+            let len = pgrx::varsize_any_exhdr(varlena);
+            let data = pgrx::vardata_any(varlena);
+            let slice = std::slice::from_raw_parts(data.cast::<u8>(), len);
+            pgrx::warning!("output {}, {:x?}", String::from_utf8_lossy(slice), slice)
+        }
 
         let s = convert_varlena_to_str_memoized(detoasted);
         tokenize(s);
@@ -583,7 +589,14 @@ where
     let typoid = DatumWithType::extract_typoid(wrapper_datum);
     let original_datum = DatumWithType::extract_datum(wrapper_datum);
     match typoid {
+        pg_sys::TEXTOID => {
+            let detoasted =
+                pg_sys::pg_detoast_datum(original_datum.cast_mut_ptr::<pg_sys::varlena>());
+            let s = convert_varlena_to_str_memoized(detoasted);
+            tokenize(s)
+        }
         pg_sys::TEXTARRAYOID | pg_sys::VARCHARARRAYOID => {
+            // TODO use safer conversion functions
             let strings = <Vec<String> as pgrx::FromDatum>::from_datum(original_datum, false)
                 .expect("must have data");
             for s in strings {
