@@ -43,6 +43,7 @@ pub(crate) mod pdb {
         fn make_search_tokenizer() -> SearchTokenizer;
     }
 
+    // FIXME rewrite
     /// Internal structure to store both the datum and its original type OID
     /// This allows the output function to properly convert any type to text
     ///
@@ -83,6 +84,7 @@ pub(crate) mod pdb {
         // Metadata needed when extracting the wrapped data
         elem_length: i16,
         elem_by_val: bool,
+        #[allow(unused)]
         elem_align: std::ffi::c_char,
         // original type OID
         typoid: pg_sys::Oid,
@@ -170,7 +172,6 @@ pub(crate) mod pdb {
             //   - Copying/serializing the datum would cause segfaults
             pgrx::set_varsize_4b(&mut (*ptr).vl_len_, size as i32);
 
-            // pgrx::warning!("new tokenizer ptr: {:?}, sz: {} of {typoid}", ptr, size);
             // Copy in the data for the underlying type
             // (based on Postgres's `ArrayCastAndSet()`).
             let data_ptr = ptr.add(1).cast::<u8>();
@@ -186,7 +187,6 @@ pub(crate) mod pdb {
         /// Check if a datum is a wrapped DatumWithType by verifying size and magic number
         pub unsafe fn is_wrapped(wrapper: pg_sys::Datum) -> bool {
             use std::mem::offset_of;
-            // let ptr = wrapper.cast_mut_ptr::<DatumWithType>();
 
             let ptr = pg_sys::pg_detoast_datum_packed(wrapper.cast_mut_ptr());
             if ptr.is_null() {
@@ -204,15 +204,11 @@ pub(crate) mod pdb {
                 return false;
             }
 
-            // pgrx::warning!("    check tok ptr: {:?}, sz: {}", ptr, vl_len);
-            let data_ptr = pgrx::varlena::vardata_any(ptr);
-            let metadata = data_ptr.cast::<DatumWithTypeContents>().read_unaligned();
-            metadata.magic == ALIAS_MAGIC
-            // && ptr
-            //     .byte_add(offset_of!(DatumWithType, magic))
-            //     .cast::<u32>()
-            //     .read_unaligned()
-            //     == ALIAS_MAGIC
+            pgrx::varlena::vardata_any(ptr)
+                .byte_add(offset_of!(DatumWithTypeContents, magic))
+                .cast::<u32>()
+                .read_unaligned()
+                == ALIAS_MAGIC
         }
 
         pub unsafe fn extract_datum(wrapper: pg_sys::Datum) -> pg_sys::Datum {
@@ -564,17 +560,6 @@ pub(crate) mod pdb {
             }
         }
     }
-
-    // extension_sql!(
-    //     r#"
-    //     -- Override the output function for pdb.alias
-    //     CREATE OR REPLACE FUNCTION pdb.alias_out(pdb.alias) RETURNS cstring
-    //         AS 'MODULE_PATHNAME', 'alias_out_safe_wrapper'
-    //         LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE;
-    //     "#,
-    //     name = "alias_out_safe_override",
-    //     requires = [tokenize_alias, alias_out_safe]
-    // );
 
     define_tokenizer_type!(
         "SimpleDef",
